@@ -689,6 +689,7 @@ spdk_env_init(const struct spdk_env_opts *opts_user)
 	}
 
 	SPDK_PRINTF("Starting %s / %s initialization...\n", SPDK_VERSION_STRING, rte_version());
+	SPDK_PRINTF("*** Using HOOKAK's SPDK fork (https://github.com/hookak/spdk) ***\n");
 
 	args_print = _sprintf_alloc("[ DPDK EAL parameters: ");
 	if (args_print == NULL) {
