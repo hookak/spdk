@@ -4642,6 +4642,15 @@ bdev_channel_abort_queued_ios(struct spdk_bdev_channel *ch)
 
 	bdev_abort_all_queued_io(&shared_resource->nomem_io, ch);
 	bdev_abort_all_buf_io(mgmt_ch, ch);
+
+	/* Also abort IOs that have been submitted but not yet completed.
+	 * This is crucial for preventing assertion failures during channel destruction
+	 * when base bdevs are removed or fail unexpectedly.
+	 */
+	bdev_abort_all_queued_io(&ch->io_submitted, ch);
+	bdev_abort_all_queued_io(&ch->io_locked, ch);
+	bdev_abort_all_queued_io(&ch->io_accel_exec, ch);
+	bdev_abort_all_queued_io(&ch->io_memory_domain, ch);
 }
 
 static void
