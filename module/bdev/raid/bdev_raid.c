@@ -4901,17 +4901,19 @@ struct raid_wait_ch_ctx {
 };
 
 /* Count one I/O that is still outstanding on the channel */
-static void _count_one_io(void *ctx, struct spdk_bdev_io *bdev_io)
+static int _count_one_io(void *ctx, struct spdk_bdev_io *bdev_io)
 {
     struct raid_wait_ch_ctx *wctx = ctx;
 
     if (spdk_bdev_io_get_io_channel(bdev_io) == wctx->ch) {
         wctx->io_left++;
     }
+
+    return 0; /* continue enumeration */
 }
 
 /* Called after each enumeration pass */
-static void _wait_and_put_ch_foreach_done(struct spdk_bdev *bdev, void *ctx, int status)
+static void _wait_and_put_ch_foreach_done(void *ctx, int status)
 {
     struct raid_wait_ch_ctx *wctx = ctx;
 
