@@ -2049,6 +2049,78 @@ raid_bdev_remove_base_bdev_on_unquiesced(void *ctx, int status)
 	raid_bdev_remove_base_bdev_done(base_info, status);
 }
 
+struct raid_wait_ch_ctx {
+    struct spdk_io_channel *ch;        /* channel that will be released */
+    struct spdk_bdev       *bdev;      /* underlying base bdev */
+    uint32_t                io_left;   /* number of outstanding IOs found in last scan */
+    struct spdk_poller     *poller;    /* periodic poller */
+};
+
+/* Count one I/O that is still outstanding on the channel */
+static int _count_one_io(void *ctx, struct spdk_bdev_io *bdev_io)
+{
+    struct raid_wait_ch_ctx *wctx = ctx;
+
+    if (spdk_bdev_io_get_io_channel(bdev_io) == wctx->ch) {
+        wctx->io_left++;
+    }
+
+    return 0; /* continue enumeration */
+}
+
+/* Called after each enumeration pass */
+static void _wait_and_put_ch_foreach_done(void *ctx, int status)
+{
+    struct raid_wait_ch_ctx *wctx = ctx;
+
+    if (wctx->io_left == 0) {
+        spdk_put_io_channel(wctx->ch);
+        spdk_poller_unregister(&wctx->poller);
+        free(wctx);
+    } else {
+        wctx->io_left = 0;
+    }
+}
+
+static int _wait_and_put_ch_poll(void *arg)
+{
+    struct raid_wait_ch_ctx *wctx = arg;
+
+    spdk_bdev_for_each_bdev_io(wctx->bdev, wctx,
+                               _count_one_io, _wait_and_put_ch_foreach_done);
+
+    return SPDK_POLLER_BUSY;
+}
+
+static void
+raid_bdev_wait_and_put_channel(struct spdk_bdev *bdev, struct spdk_io_channel *ch)
+{
+    struct raid_wait_ch_ctx *wctx;
+
+    if (ch == NULL || bdev == NULL) {
+        if (ch != NULL) {
+            spdk_put_io_channel(ch);
+        }
+        return;
+    }
+
+    wctx = calloc(1, sizeof(*wctx));
+    if (wctx == NULL) {
+        SPDK_ERRLOG("Unable to allocate wait context – releasing channel immediately.\n");
+        spdk_put_io_channel(ch);
+        return;
+    }
+
+    wctx->ch   = ch;
+    wctx->bdev = bdev;
+
+    /* 1ms poller */
+    wctx->poller = SPDK_POLLER_REGISTER(_wait_and_put_ch_poll, wctx, 1000);
+
+    /* Immediate first check */
+    _wait_and_put_ch_poll(wctx);
+}
+
 static void
 raid_bdev_channel_remove_base_bdev(struct spdk_io_channel_iter *i)
 {
@@ -4892,75 +4964,3 @@ bdev_raid_trace(void)
 	spdk_trace_tpoint_register_relation(TRACE_BDEV_IO_DONE, OBJECT_BDEV_RAID_IO, 0);
 }
 SPDK_TRACE_REGISTER_FN(bdev_raid_trace, "bdev_raid", TRACE_GROUP_BDEV_RAID)
-
-struct raid_wait_ch_ctx {
-    struct spdk_io_channel *ch;        /* channel that will be released */
-    struct spdk_bdev       *bdev;      /* underlying base bdev */
-    uint32_t                io_left;   /* number of outstanding IOs found in last scan */
-    struct spdk_poller     *poller;    /* periodic poller */
-};
-
-/* Count one I/O that is still outstanding on the channel */
-static int _count_one_io(void *ctx, struct spdk_bdev_io *bdev_io)
-{
-    struct raid_wait_ch_ctx *wctx = ctx;
-
-    if (spdk_bdev_io_get_io_channel(bdev_io) == wctx->ch) {
-        wctx->io_left++;
-    }
-
-    return 0; /* continue enumeration */
-}
-
-/* Called after each enumeration pass */
-static void _wait_and_put_ch_foreach_done(void *ctx, int status)
-{
-    struct raid_wait_ch_ctx *wctx = ctx;
-
-    if (wctx->io_left == 0) {
-        spdk_put_io_channel(wctx->ch);
-        spdk_poller_unregister(&wctx->poller);
-        free(wctx);
-    } else {
-        wctx->io_left = 0;
-    }
-}
-
-static int _wait_and_put_ch_poll(void *arg)
-{
-    struct raid_wait_ch_ctx *wctx = arg;
-
-    spdk_bdev_for_each_bdev_io(wctx->bdev, wctx,
-                               _count_one_io, _wait_and_put_ch_foreach_done);
-
-    return SPDK_POLLER_BUSY;
-}
-
-static void
-raid_bdev_wait_and_put_channel(struct spdk_bdev *bdev, struct spdk_io_channel *ch)
-{
-    struct raid_wait_ch_ctx *wctx;
-
-    if (ch == NULL || bdev == NULL) {
-        if (ch != NULL) {
-            spdk_put_io_channel(ch);
-        }
-        return;
-    }
-
-    wctx = calloc(1, sizeof(*wctx));
-    if (wctx == NULL) {
-        SPDK_ERRLOG("Unable to allocate wait context – releasing channel immediately.\n");
-        spdk_put_io_channel(ch);
-        return;
-    }
-
-    wctx->ch   = ch;
-    wctx->bdev = bdev;
-
-    /* 1ms poller */
-    wctx->poller = SPDK_POLLER_REGISTER(_wait_and_put_ch_poll, wctx, 1000);
-
-    /* Immediate first check */
-    _wait_and_put_ch_poll(wctx);
-}

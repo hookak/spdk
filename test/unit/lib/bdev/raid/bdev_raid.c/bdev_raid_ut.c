@@ -201,6 +201,11 @@ DEFINE_STUB(spdk_bdev_unmap_blocks, int, (struct spdk_bdev_desc *desc,
 		uint64_t offset_blocks, uint64_t num_blocks,
 		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 
+/* Add stubs for functions used in the new wait_and_put_channel functionality */
+DEFINE_STUB_V(spdk_bdev_for_each_bdev_io, (struct spdk_bdev *bdev, void *ctx,
+		spdk_bdev_io_fn fn, spdk_bdev_for_each_io_cb cb));
+DEFINE_STUB(spdk_bdev_io_get_io_channel, struct spdk_io_channel *, (struct spdk_bdev_io *bdev_io), NULL);
+
 uint32_t
 spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
 {
