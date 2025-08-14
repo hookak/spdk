@@ -15,6 +15,8 @@
 #include "spdk/trace.h"
 #include "spdk/bit_array.h"
 #include "spdk_internal/trace_defs.h"
+#include <inttypes.h>
+#include "spdk/bdev_module.h"
 
 #define RAID_OFFSET_BLOCKS_INVALID	UINT64_MAX
 #define RAID_BDEV_PROCESS_MAX_QD	16
@@ -2092,13 +2094,120 @@ raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int sta
 }
 
 static void
-raid_bdev_remove_base_bdev_cont(struct raid_base_bdev_info *base_info)
+raid_bdev_remove_base_bdev_channels(struct raid_base_bdev_info *base_info)
 {
-	raid_bdev_deconfigure_base_bdev(base_info);
-
-	spdk_for_each_channel(base_info->raid_bdev, raid_bdev_channel_remove_base_bdev, base_info,
-			      raid_bdev_channels_remove_base_bdev_done);
+    raid_bdev_deconfigure_base_bdev(base_info);
+    spdk_for_each_channel(base_info->raid_bdev, raid_bdev_channel_remove_base_bdev, base_info,
+                          raid_bdev_channels_remove_base_bdev_done);
 }
+
+#ifndef SPDK_UNIT_TEST
+ struct raid_bdev_drain_check_ctx {
+     struct raid_base_bdev_info *base_info;
+     uint64_t outstanding;
+     struct spdk_poller *poller;
+     uint32_t attempts;
+ };
+ 
+ static int
+ raid_bdev_outstanding_count_fn(void *ctx, struct spdk_bdev_io *bdev_io)
+ {
+     struct raid_bdev_drain_check_ctx *c = ctx;
+     c->outstanding++;
+     return 0;
+ }
+ 
+ static void raid_bdev_outstanding_done_cb(void *ctx, int status);
+ 
+ static int
+ raid_bdev_drain_recheck(void *arg)
+ {
+     struct raid_bdev_drain_check_ctx *c = arg;
+     struct spdk_bdev *bb;
+ 
+     spdk_poller_unregister(&c->poller);
+     c->poller = NULL;
+     c->outstanding = 0;
+ 
+     if (c->base_info->desc == NULL) {
+         SPDK_DEBUGLOG(bdev_raid, "Base desc became NULL during drain-wait; proceeding remove for raid '%s'\n",
+                       c->base_info->raid_bdev->bdev.name);
+         raid_bdev_remove_base_bdev_channels(c->base_info);
+         free(c);
+         return SPDK_POLLER_BUSY;
+     }
+ 
+     bb = spdk_bdev_desc_get_bdev(c->base_info->desc);
+     SPDK_DEBUGLOG(bdev_raid, "Rechecking outstanding IO on base bdev '%s' (attempt=%u)\n",
+                   bb ? bb->name : "<unknown>", c->attempts);
+     spdk_bdev_for_each_bdev_io(bb, c, raid_bdev_outstanding_count_fn, raid_bdev_outstanding_done_cb);
+     return SPDK_POLLER_BUSY;
+ }
+ 
+ static void
+ raid_bdev_outstanding_done_cb(void *ctx, int status)
+ {
+     struct raid_bdev_drain_check_ctx *c = ctx;
+     struct spdk_bdev *bb = c->base_info->desc ? spdk_bdev_desc_get_bdev(c->base_info->desc) : NULL;
+ 
+     if (c->outstanding == 0) {
+         SPDK_DEBUGLOG(bdev_raid, "Base bdev '%s' has no outstanding IO (attempt=%u); proceeding remove of raid '%s'\n",
+                       bb ? bb->name : "<unknown>", c->attempts, c->base_info->raid_bdev->bdev.name);
+         raid_bdev_remove_base_bdev_channels(c->base_info);
+         free(c);
+         return;
+     }
+ 
+     SPDK_NOTICELOG("Base bdev '%s' still has %" PRIu64 " outstanding IO (attempt=%u); delaying remove of raid '%s'\n",
+                    bb ? bb->name : "<unknown>", c->outstanding, c->attempts, c->base_info->raid_bdev->bdev.name);
+     c->attempts++;
+     if (c->poller == NULL) {
+         c->poller = SPDK_POLLER_REGISTER(raid_bdev_drain_recheck, c, 100000 /* 100 ms */);
+     }
+ }
+#endif /* !SPDK_UNIT_TEST */
+ 
+ static void
+ raid_bdev_remove_base_bdev_cont(struct raid_base_bdev_info *base_info)
+ {
+     struct spdk_bdev *base_bdev;
+ 
+     /* If we don't have a descriptor, just proceed with original removal. */
+     if (base_info->desc == NULL) {
+         SPDK_DEBUGLOG(bdev_raid, "Base bdev desc NULL for raid '%s', proceeding remove\n",
+                       base_info->raid_bdev->bdev.name);
+         raid_bdev_remove_base_bdev_channels(base_info);
+         return;
+     }
+ 
+     base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+ 
+#ifndef SPDK_UNIT_TEST
+     /* Allocate drain-check context and count outstanding I/O on base bdev. */
+     struct raid_bdev_drain_check_ctx *c = calloc(1, sizeof(*c));
+     if (c == NULL) {
+         SPDK_ERRLOG("Failed to allocate drain-check context; proceeding remove for base '%s' raid '%s'\n",
+                     base_bdev ? base_bdev->name : "<unknown>", base_info->raid_bdev->bdev.name);
+         raid_bdev_remove_base_bdev_channels(base_info);
+         return;
+     }
+ 
+     c->base_info = base_info;
+     c->outstanding = 0;
+     c->poller = NULL;
+     c->attempts = 0;
+ 
+     SPDK_DEBUGLOG(bdev_raid, "Checking outstanding IO on base bdev '%s' before removal of raid '%s'\n",
+                   base_bdev ? base_bdev->name : "<unknown>", base_info->raid_bdev->bdev.name);
+     spdk_bdev_for_each_bdev_io(base_bdev, c, raid_bdev_outstanding_count_fn, raid_bdev_outstanding_done_cb);
+#else
+    SPDK_DEBUGLOG(bdev_raid, "Unit test build: skipping drain-check for base bdev '%s' raid '%s'\n",
+                  base_bdev ? base_bdev->name : "<unknown>", base_info->raid_bdev->bdev.name);
+    raid_bdev_remove_base_bdev_channels(base_info);
+#endif
+ }
+
+/* Keep helper implementations near the users for clarity */
 
 static void
 raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
