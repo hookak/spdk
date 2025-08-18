@@ -2518,9 +2518,11 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 	ch->ref--;
 
 	if (ch->ref == 0) {
+		/* Destroy synchronously on the owning thread to ensure child
+		 * io_device destroy callbacks complete before freeing resources.
+		 */
 		ch->destroy_ref++;
-		rc = spdk_thread_send_msg(thread, put_io_channel, ch);
-		assert(rc == 0);
+		put_io_channel(ch);
 	}
 }
 
