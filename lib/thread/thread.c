@@ -2522,7 +2522,10 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 		 * io_device destroy callbacks complete before freeing resources.
 		 */
 		ch->destroy_ref++;
+		SPDK_NOTICELOG("Synchronous io_channel destroy start: ch=%p, io_device=%s (%p), thread=%s\n",
+			      ch, ch->dev->name, ch->dev->io_device, thread->name);
 		put_io_channel(ch);
+		SPDK_NOTICELOG("Synchronous io_channel destroy done: ch=%p\n", ch);
 	}
 }
 
