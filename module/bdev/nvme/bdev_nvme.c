@@ -787,7 +787,6 @@ bdev_nvme_clear_current_io_path(struct nvme_bdev_channel *nbdev_ch)
 	nbdev_ch->current_io_path = NULL;
 	nbdev_ch->rr_counter = 0;
 }
-
 static struct nvme_io_path *
 _bdev_nvme_get_io_path(struct nvme_bdev_channel *nbdev_ch, struct nvme_ns *nvme_ns)
 {
@@ -987,6 +986,17 @@ __bdev_nvme_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status s
 }
 
 static void bdev_nvme_abort_retry_ios(struct nvme_bdev_channel *nbdev_ch);
+
+/* Helper to abort retry IOs on each nvme_bdev_channel for a given nvme_bdev. */
+static void
+_nvme_abort_retry_ios_on_ch(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct nvme_bdev_channel *nbdev_ch = spdk_io_channel_get_ctx(ch);
+
+	bdev_nvme_abort_retry_ios(nbdev_ch);
+	spdk_for_each_channel_continue(i, 0);
+}
 
 static void
 bdev_nvme_destroy_bdev_channel_cb(void *io_device, void *ctx_buf)
@@ -1553,7 +1563,6 @@ bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 
 	return true;
 }
-
 static inline void
 bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 				  const struct spdk_nvme_cpl *cpl)
@@ -2299,6 +2308,16 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Resetting controller failed.\n");
 		if (bdev_nvme_check_fast_io_fail_timeout(nvme_ctrlr)) {
 			nvme_ctrlr->fast_io_fail_timedout = true;
+
+			/* Proactively abort retry IOs on all nbdev channels associated with this
+			 * controller so completions are delivered before channel destruction. */
+			if (nvme_ctrlr->nbdev_ctrlr != NULL) {
+				struct nvme_bdev *nbdev;
+
+				TAILQ_FOREACH(nbdev, &nvme_ctrlr->nbdev_ctrlr->bdevs, tailq) {
+					spdk_for_each_channel(nbdev, _nvme_abort_retry_ios_on_ch, NULL, NULL);
+				}
+			}
 		}
 	} else {
 		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Resetting controller successful.\n");
@@ -2340,8 +2359,6 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 		break;
 	}
 }
-
-static void
 bdev_nvme_reset_create_qpairs_failed(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
 {
 	bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
@@ -3122,8 +3139,6 @@ _bdev_nvme_reset_io(struct nvme_io_path *io_path, struct nvme_bdev_io *bio)
 
 	return rc;
 }
-
-static void
 bdev_nvme_freeze_bdev_channel_done(struct nvme_bdev *nbdev, void *ctx, int status)
 {
 	struct nvme_bdev_io *bio = ctx;
@@ -3915,8 +3930,6 @@ _nvme_ana_state_str(enum spdk_nvme_ana_state ana_state)
 		return NULL;
 	}
 }
-
-static int
 bdev_nvme_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int array_size)
 {
 	struct spdk_memory_domain **_domains = NULL;
@@ -4665,8 +4678,6 @@ nvme_bdev_alloc(void)
 
 	return nbdev;
 }
-
-static int
 nvme_bdev_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ns *nvme_ns)
 {
 	struct nvme_bdev *nbdev;
@@ -6241,7 +6252,6 @@ spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size)
 static bool bdev_nvme_check_io_error_resiliency_params(int32_t ctrlr_loss_timeout_sec,
 		uint32_t reconnect_delay_sec,
 		uint32_t fast_io_fail_timeout_sec);
-
 static int
 bdev_nvme_validate_opts(const struct spdk_bdev_nvme_opts *opts)
 {
@@ -7036,7 +7046,6 @@ _bdev_nvme_delete(struct nvme_ctrlr *nvme_ctrlr, const struct spdk_nvme_path_id 
 
 	return rc;
 }
-
 int
 spdk_bdev_nvme_delete(const char *name, const struct spdk_nvme_path_id *path_id,
 		      spdk_bdev_nvme_delete_cb delete_cb, void *cb_ctx)
@@ -7810,7 +7819,6 @@ bdev_nvme_library_init(void)
 
 	return 0;
 }
-
 static void
 bdev_nvme_fini_destruct_ctrlrs(void)
 {
@@ -8578,8 +8586,6 @@ bdev_nvme_comparev_and_writev(struct nvme_bdev_io *bio, struct iovec *cmp_iov, i
 
 	return rc;
 }
-
-static int
 bdev_nvme_unmap(struct nvme_bdev_io *bio, uint64_t offset_blocks, uint64_t num_blocks)
 {
 	struct spdk_nvme_dsm_range dsm_ranges[SPDK_NVME_DATASET_MANAGEMENT_MAX_RANGES];
@@ -9356,8 +9362,6 @@ bdev_nvme_authenticate_ctrlr_done(void *_ctx, int status)
 	spdk_for_each_channel(ctx->nctrlr, bdev_nvme_authenticate_qpair, ctx,
 			      bdev_nvme_authenticate_qpairs_done);
 }
-
-static void
 bdev_nvme_authenticate_ctrlr(struct bdev_nvme_set_keys_ctx *ctx)
 {
 	struct spdk_nvme_ctrlr_key_opts opts = {};
