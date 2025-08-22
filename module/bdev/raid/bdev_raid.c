@@ -2013,6 +2013,9 @@ raid_bdev_remove_base_bdev_reset_complete(struct spdk_bdev_io *bdev_io, bool suc
 
 	spdk_bdev_free_io(bdev_io);
 
+	SPDK_DEBUGLOG(bdev_raid, "reset complete for base bdev '%s' success=%d\n",
+		      base_info->name, success);
+
 	if (!success) {
 		raid_bdev_remove_base_bdev_done(base_info, -EIO);
 		return;
@@ -2028,9 +2031,12 @@ raid_bdev_remove_base_bdev_reset_retry(void *cb_arg)
 	struct raid_base_bdev_info *base_info = ctx->base_info;
 	int rc;
 
+	SPDK_DEBUGLOG(bdev_raid, "retrying reset for base bdev '%s'\n", base_info->name);
+
 	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
 			     raid_bdev_remove_base_bdev_reset_complete, base_info);
 	if (rc == 0) {
+		SPDK_DEBUGLOG(bdev_raid, "reset retry submitted for base bdev '%s'\n", base_info->name);
 		free(ctx);
 		return;
 	} else if (rc == -ENOMEM) {
@@ -2058,9 +2064,12 @@ raid_bdev_remove_base_bdev_issue_reset(struct raid_base_bdev_info *base_info)
 	int rc;
 
 	bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+	SPDK_DEBUGLOG(bdev_raid, "issuing reset for base bdev '%s' of raid '%s'\n",
+		      base_info->name, base_info->raid_bdev->bdev.name);
 	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
 			     raid_bdev_remove_base_bdev_reset_complete, base_info);
 	if (rc == 0) {
+		SPDK_DEBUGLOG(bdev_raid, "reset submitted for base bdev '%s'\n", base_info->name);
 		return;
 	}
 
@@ -2079,6 +2088,7 @@ raid_bdev_remove_base_bdev_issue_reset(struct raid_base_bdev_info *base_info)
 		ctx->wait_entry.bdev = bdev;
 		ctx->wait_entry.cb_fn = raid_bdev_remove_base_bdev_reset_retry;
 		ctx->wait_entry.cb_arg = ctx;
+		SPDK_DEBUGLOG(bdev_raid, "reset ENOMEM; queue wait for base bdev '%s'\n", base_info->name);
 		rc2 = spdk_bdev_queue_io_wait(bdev, base_info->app_thread_ch, &ctx->wait_entry);
 		if (rc2 != 0) {
 			free(ctx);
@@ -2088,6 +2098,8 @@ raid_bdev_remove_base_bdev_issue_reset(struct raid_base_bdev_info *base_info)
 	}
 
 	/* Other error */
+	SPDK_ERRLOG("reset submit failed for base bdev '%s': %s\n",
+		   base_info->name, spdk_strerror(-rc));
 	raid_bdev_remove_base_bdev_done(base_info, rc);
 }
 
@@ -2113,6 +2125,8 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, 
 	}
 
 	/* Before tearing down channels, reset the base bdev to drain/abort outstanding IOs. */
+	SPDK_DEBUGLOG(bdev_raid, "superblock updated; proceeding to reset base bdev '%s'\n",
+		      base_info->name);
 	raid_bdev_remove_base_bdev_issue_reset(base_info);
 }
 
@@ -2152,6 +2166,8 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 	}
 
 	/* No superblock write path: issue reset before continuing removal. */
+	SPDK_DEBUGLOG(bdev_raid, "no superblock update; proceeding to reset base bdev '%s'\n",
+		      base_info->name);
 	raid_bdev_remove_base_bdev_issue_reset(base_info);
 }
 
