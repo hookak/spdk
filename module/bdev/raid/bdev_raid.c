@@ -2021,6 +2021,82 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, 
 	raid_bdev_remove_base_bdev_cont(base_info);
 }
 
+/* Forward declarations for functions referenced below. */
+static int raid_bdev_process_base_bdev_remove(struct raid_bdev_process *process,
+                                            struct raid_base_bdev_info *base_info);
+static int raid_bdev_remove_base_bdev_quiesce(struct raid_base_bdev_info *base_info);
+
+/* Proceed with the existing base-bdev removal flow after reset completes. */
+static void
+raid_bdev_remove_base_bdev_proceed(struct raid_base_bdev_info *base_info)
+{
+    struct raid_bdev *raid_bdev = base_info->raid_bdev;
+
+    if (raid_bdev->process != NULL) {
+        /* Process-aware path */
+        int ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
+        if (ret != 0) {
+            raid_bdev_remove_base_bdev_done(base_info, ret);
+        }
+    } else {
+        /* Direct remove path */
+        int ret = raid_bdev_remove_base_bdev_quiesce(base_info);
+        if (ret != 0) {
+            raid_bdev_remove_base_bdev_done(base_info, ret);
+        }
+    }
+}
+
+/* Reset completion for base-bdev removal. Always continue with removal. */
+static void
+raid_bdev_remove_base_bdev_reset_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+    struct raid_base_bdev_info *base_info = cb_arg;
+
+    spdk_bdev_free_io(bdev_io);
+
+    raid_bdev_remove_base_bdev_proceed(base_info);
+}
+
+/* Try to submit a reset to the base-bdev before removal. Retry on -ENOMEM. */
+static void _raid_bdev_remove_base_bdev_issue_reset(void *ctx);
+
+static void
+_raid_bdev_remove_base_bdev_issue_reset(void *ctx)
+{
+    struct raid_base_bdev_info *base_info = ctx;
+    struct spdk_bdev_desc *desc = base_info->desc;
+    int ret;
+
+    assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+    if (base_info->app_thread_ch == NULL) {
+        /* Ensure we have a channel on the app thread for reset submission */
+        base_info->app_thread_ch = spdk_bdev_get_io_channel(desc);
+        if (base_info->app_thread_ch == NULL) {
+            SPDK_ERRLOG("Unable to get app thread io_channel for base bdev %s\n", base_info->name);
+            raid_bdev_remove_base_bdev_proceed(base_info);
+            return;
+        }
+    }
+
+    ret = spdk_bdev_reset(desc, base_info->app_thread_ch,
+                          raid_bdev_remove_base_bdev_reset_complete, base_info);
+    if (spdk_unlikely(ret != 0)) {
+        if (ret == -ENOMEM) {
+            /* Retry soon on the app thread */
+            spdk_thread_send_msg(spdk_thread_get_app_thread(), _raid_bdev_remove_base_bdev_issue_reset,
+                                 base_info);
+            return;
+        }
+
+        /* On other errors, continue removal anyway */
+        SPDK_WARNLOG("spdk_bdev_reset submission failed for base bdev %s, ret=%d. Continuing removal.\n",
+                     base_info->name, ret);
+        raid_bdev_remove_base_bdev_proceed(base_info);
+    }
+}
+
 static void
 raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 {
@@ -2209,6 +2285,40 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 		base_info->remove_cb = cb_fn;
 		base_info->remove_cb_ctx = cb_ctx;
 
+		/* Issue a reset on the base-bdev before proceeding with removal. */
+		if (base_info->app_thread_ch == NULL) {
+			base_info->app_thread_ch = spdk_bdev_get_io_channel(base_info->desc);
+			if (base_info->app_thread_ch == NULL) {
+				SPDK_ERRLOG("Unable to get app thread io_channel for base bdev %s\n", base_info->name);
+				/* Fallback to original path */
+				if (raid_bdev->process != NULL) {
+					ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
+				} else {
+					ret = raid_bdev_remove_base_bdev_quiesce(base_info);
+				}
+				if (ret != 0) {
+					base_info->remove_scheduled = false;
+				}
+				return ret;
+			}
+		}
+
+		ret = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
+				      raid_bdev_remove_base_bdev_reset_complete, base_info);
+		if (ret == 0) {
+			/* Reset submitted; removal will continue on completion. */
+			return 0;
+		}
+		if (ret == -ENOMEM) {
+			/* Retry reset asynchronously but report success to keep flow consistent. */
+			spdk_thread_send_msg(spdk_thread_get_app_thread(), _raid_bdev_remove_base_bdev_issue_reset,
+					     base_info);
+			return 0;
+		}
+
+		/* On other errors, continue with original removal path immediately. */
+		SPDK_WARNLOG("spdk_bdev_reset submission failed for base bdev %s, ret=%d. Continuing removal.\n",
+			    base_info->name, ret);
 		if (raid_bdev->process != NULL) {
 			ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
 		} else {
