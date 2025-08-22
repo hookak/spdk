@@ -1997,6 +1997,100 @@ raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int sta
 			    base_info);
 }
 
+/* Context and helpers to issue a base bdev reset during removal to drain outstanding IOs */
+static void raid_bdev_remove_base_bdev_cont(struct raid_base_bdev_info *base_info);
+struct raid_bdev_remove_reset_ctx {
+	struct raid_base_bdev_info *base_info;
+	struct spdk_bdev_io_wait_entry wait_entry;
+};
+
+static void raid_bdev_remove_base_bdev_issue_reset(struct raid_base_bdev_info *base_info);
+
+static void
+raid_bdev_remove_base_bdev_reset_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct raid_base_bdev_info *base_info = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		raid_bdev_remove_base_bdev_done(base_info, -EIO);
+		return;
+	}
+
+	raid_bdev_remove_base_bdev_cont(base_info);
+}
+
+static void
+raid_bdev_remove_base_bdev_reset_retry(void *cb_arg)
+{
+	struct raid_bdev_remove_reset_ctx *ctx = cb_arg;
+	struct raid_base_bdev_info *base_info = ctx->base_info;
+	int rc;
+
+	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
+			     raid_bdev_remove_base_bdev_reset_complete, base_info);
+	if (rc == 0) {
+		free(ctx);
+		return;
+	} else if (rc == -ENOMEM) {
+		/* Requeue for another retry */
+		ctx->wait_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+		ctx->wait_entry.cb_fn = raid_bdev_remove_base_bdev_reset_retry;
+		ctx->wait_entry.cb_arg = ctx;
+		rc = spdk_bdev_queue_io_wait(ctx->wait_entry.bdev, base_info->app_thread_ch, &ctx->wait_entry);
+		if (rc != 0) {
+			free(ctx);
+			raid_bdev_remove_base_bdev_done(base_info, rc);
+		}
+		return;
+	} else {
+		free(ctx);
+		raid_bdev_remove_base_bdev_done(base_info, rc);
+		return;
+	}
+}
+
+static void
+raid_bdev_remove_base_bdev_issue_reset(struct raid_base_bdev_info *base_info)
+{
+	struct spdk_bdev *bdev;
+	int rc;
+
+	bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
+			     raid_bdev_remove_base_bdev_reset_complete, base_info);
+	if (rc == 0) {
+		return;
+	}
+
+	if (rc == -ENOMEM) {
+		struct raid_bdev_remove_reset_ctx *ctx;
+		int rc2;
+
+		ctx = calloc(1, sizeof(*ctx));
+		if (ctx == NULL) {
+			SPDK_ERRLOG("Failed to alloc reset retry ctx for base bdev removal\n");
+			raid_bdev_remove_base_bdev_done(base_info, -ENOMEM);
+			return;
+		}
+
+		ctx->base_info = base_info;
+		ctx->wait_entry.bdev = bdev;
+		ctx->wait_entry.cb_fn = raid_bdev_remove_base_bdev_reset_retry;
+		ctx->wait_entry.cb_arg = ctx;
+		rc2 = spdk_bdev_queue_io_wait(bdev, base_info->app_thread_ch, &ctx->wait_entry);
+		if (rc2 != 0) {
+			free(ctx);
+			raid_bdev_remove_base_bdev_done(base_info, rc2);
+		}
+		return;
+	}
+
+	/* Other error */
+	raid_bdev_remove_base_bdev_done(base_info, rc);
+}
+
 static void
 raid_bdev_remove_base_bdev_cont(struct raid_base_bdev_info *base_info)
 {
@@ -2018,7 +2112,8 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, 
 		return;
 	}
 
-	raid_bdev_remove_base_bdev_cont(base_info);
+	/* Before tearing down channels, reset the base bdev to drain/abort outstanding IOs. */
+	raid_bdev_remove_base_bdev_issue_reset(base_info);
 }
 
 static void
@@ -2056,7 +2151,8 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 		}
 	}
 
-	raid_bdev_remove_base_bdev_cont(base_info);
+	/* No superblock write path: issue reset before continuing removal. */
+	raid_bdev_remove_base_bdev_issue_reset(base_info);
 }
 
 static int
