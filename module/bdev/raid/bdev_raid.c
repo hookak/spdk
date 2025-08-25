@@ -2007,6 +2007,31 @@ raid_bdev_remove_base_bdev_cont(struct raid_base_bdev_info *base_info)
 }
 
 static void
+raid_bdev_remove_base_bdev_reset_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct raid_base_bdev_info *base_info = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	raid_bdev_remove_base_bdev_cont(base_info);
+}
+
+static void
+raid_bdev_remove_base_bdev_reset_then_continue(struct raid_base_bdev_info *base_info)
+{
+	int rc;
+
+	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
+			     raid_bdev_remove_base_bdev_reset_done, base_info);
+	if (rc != 0) {
+		SPDK_WARNLOG("Reset base bdev '%s' before removal failed: %s\n",
+			     base_info->name, spdk_strerror(-rc));
+		/* Proceed with removal even if reset submission failed */
+		raid_bdev_remove_base_bdev_cont(base_info);
+	}
+}
+
+static void
 raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
 {
 	struct raid_base_bdev_info *base_info = ctx;
@@ -2018,7 +2043,7 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, 
 		return;
 	}
 
-	raid_bdev_remove_base_bdev_cont(base_info);
+	raid_bdev_remove_base_bdev_reset_then_continue(base_info);
 }
 
 static void
@@ -2056,7 +2081,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 		}
 	}
 
-	raid_bdev_remove_base_bdev_cont(base_info);
+	raid_bdev_remove_base_bdev_reset_then_continue(base_info);
 }
 
 static int
