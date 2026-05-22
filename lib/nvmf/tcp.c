@@ -1185,6 +1185,32 @@ nvmf_tcp_qpair_disconnect(struct spdk_nvmf_tcp_qpair *tqpair)
 		assert(tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_ERROR);
 		spdk_poller_unregister(&tqpair->timeout_poller);
 
+		/* fix B (n3r/longhorn#324): detach the socket from the poll group
+		 * at first EXITING transition. Without this, nvmf_tcp_sock_cb keeps
+		 * firing on the still-registered socket (kernel reports EPOLLHUP/
+		 * EPOLLERR sticky after host close) while spdk_nvmf_qpair_disconnect
+		 * defers waiting for outstanding to drain. That spin pins the reactor
+		 * at 100%, which in turn starves the bdev / KATO / admin pollers that
+		 * are needed to actually drain outstanding — self-sustaining deadlock.
+		 *
+		 * Removing the socket here breaks the spin: the next reactor tick
+		 * proceeds to other pollers, outstanding drains via the normal
+		 * completion path, state_cb fires, and close_qpair runs the rest of
+		 * the cleanup (including the second sock_group_remove inside
+		 * nvmf_tcp_poll_group_remove — sock groups tolerate a double-remove
+		 * with ENOENT, no crash).
+		 *
+		 * Safety: Linux epoll handles EPOLL_CTL_DEL race-safely vs an
+		 * in-progress epoll_wait, so calling from inside sock_cb's callstack
+		 * is safe on SPDK's posix sock implementation.
+		 */
+		if (tqpair->group && tqpair->sock) {
+			int _rc = spdk_sock_group_remove_sock(tqpair->group->sock_group,
+							      tqpair->sock);
+			SPDK_NOTICELOG("DIAG_FIX_B_SOCK_REMOVE: tqpair=%p rc=%d errno=%d\n",
+				       tqpair, _rc, errno);
+		}
+
 		/* This will end up calling nvmf_tcp_close_qpair */
 		spdk_nvmf_qpair_disconnect(&tqpair->qpair);
 	}
