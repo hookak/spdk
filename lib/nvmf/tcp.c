@@ -350,6 +350,13 @@ struct spdk_nvmf_tcp_qpair {
 	 * diag_read_fail_logged gates the D7 log to once per qpair lifetime. */
 	uint64_t				diag_last_recv_tsc;
 	bool					diag_read_fail_logged;
+
+	/* fix B (n3r/longhorn#324): set when nvmf_tcp_qpair_disconnect has already
+	 * removed the socket from the poll group early (to break the reactor-100%
+	 * spin during deferred close). nvmf_tcp_poll_group_remove uses this flag
+	 * to skip the redundant spdk_sock_group_remove_sock call that would
+	 * otherwise violate the API invariant (assert(group_impl == sock->group_impl)). */
+	bool					sock_removed_early;
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -1209,6 +1216,13 @@ nvmf_tcp_qpair_disconnect(struct spdk_nvmf_tcp_qpair *tqpair)
 							      tqpair->sock);
 			SPDK_NOTICELOG("DIAG_FIX_B_SOCK_REMOVE: tqpair=%p rc=%d errno=%d\n",
 				       tqpair, _rc, errno);
+			if (_rc == 0) {
+				/* tell nvmf_tcp_poll_group_remove to skip its own
+				 * spdk_sock_group_remove_sock call — calling it
+				 * again with sock->group_impl already NULL would
+				 * trip the API invariant assert. */
+				tqpair->sock_removed_early = true;
+			}
 		}
 
 		/* This will end up calling nvmf_tcp_close_qpair */
@@ -3628,10 +3642,21 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	/* Try to force out any pending writes, intentionally do not check rc as it is best effort try. */
 	spdk_sock_flush(tqpair->sock);
 
-	rc = spdk_sock_group_remove_sock(tgroup->sock_group, tqpair->sock);
-	if (rc != 0) {
-		SPDK_ERRLOG("Could not remove sock from sock_group: %s (%d)\n",
-			    spdk_strerror(errno), errno);
+	if (tqpair->sock_removed_early) {
+		/* fix B (n3r/longhorn#324): nvmf_tcp_qpair_disconnect already
+		 * removed the sock from the poll group early to break the
+		 * reactor spin. Calling spdk_sock_group_remove_sock again here
+		 * would violate the API invariant (sock->group_impl is NULL),
+		 * so skip. The work that the second call would have done
+		 * (epoll_ctl DEL, cb_fn=NULL, TAILQ_REMOVE) was already done. */
+		SPDK_NOTICELOG("DIAG_FIX_B_POLL_GROUP_REMOVE_SKIP: tqpair=%p\n", tqpair);
+		rc = 0;
+	} else {
+		rc = spdk_sock_group_remove_sock(tgroup->sock_group, tqpair->sock);
+		if (rc != 0) {
+			SPDK_ERRLOG("Could not remove sock from sock_group: %s (%d)\n",
+				    spdk_strerror(errno), errno);
+		}
 	}
 
 	nvmf_tcp_abort_await_buffer_reqs(tqpair);
