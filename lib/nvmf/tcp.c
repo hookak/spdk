@@ -329,6 +329,13 @@ struct spdk_nvmf_tcp_qpair {
 
 	TAILQ_ENTRY(spdk_nvmf_tcp_qpair)	link;
 	bool					pending_flush;
+
+	/* DIAG (n3r/longhorn#324): instrumentation to identify the root cause
+	 * of reactor-100% saturation after a peer disconnect. These two fields
+	 * count how often nvmf_tcp_sock_cb is invoked on this tqpair and gate
+	 * a periodic NOTICELOG so a runaway sock_cb loop becomes visible. */
+	uint64_t				diag_sock_cb_count;
+	uint64_t				diag_sock_cb_log_tsc;
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -1149,6 +1156,17 @@ nvmf_tcp_qpair_disconnect(struct spdk_nvmf_tcp_qpair *tqpair)
 	spdk_trace_record(TRACE_TCP_QP_DISCONNECT, tqpair->qpair.trace_id, 0, 0);
 
 	if (tqpair->state <= NVMF_TCP_QPAIR_STATE_RUNNING) {
+		/* DIAG D2 (n3r/longhorn#324): the first time we tear down this
+		 * tqpair, capture the caller chain so we can identify the trigger
+		 * (TCP sock_process / KATO timer / subsystem teardown / ...).
+		 * Fires exactly once per qpair lifetime — the state guard above
+		 * blocks re-entries naturally. */
+		SPDK_NOTICELOG("DIAG_DISCONNECT_ENTRY: tqpair=%p prev_state=%d recv_state=%d "
+			       "caller=%p caller2=%p caller3=%p\n",
+			       tqpair, tqpair->state, tqpair->recv_state,
+			       __builtin_return_address(0),
+			       __builtin_return_address(1),
+			       __builtin_return_address(2));
 		nvmf_tcp_qpair_set_state(tqpair, NVMF_TCP_QPAIR_STATE_EXITING);
 		assert(tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_ERROR);
 		spdk_poller_unregister(&tqpair->timeout_poller);
@@ -3414,6 +3432,31 @@ static void
 nvmf_tcp_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock)
 {
 	struct spdk_nvmf_tcp_qpair *tqpair = arg;
+
+	/* DIAG D1 (n3r/longhorn#324): per-tqpair sock_cb fire counter. We log
+	 * the rolling 10s rate so a sustained sock_cb spin (which is what we
+	 * suspect drives the reactor-100% deadlock after a peer disconnect)
+	 * shows up directly in the IM log. Health: cnt stays low (idle qpair)
+	 * or matches genuine I/O. Pathology: cnt rises into the 100k/s range
+	 * even while the qpair is supposed to be tearing down. */
+	tqpair->diag_sock_cb_count++;
+	if (spdk_unlikely((tqpair->diag_sock_cb_count & 0x3FF) == 0)) {
+		uint64_t now = spdk_get_ticks();
+		uint64_t hz = spdk_get_ticks_hz();
+		if (tqpair->diag_sock_cb_log_tsc == 0) {
+			tqpair->diag_sock_cb_log_tsc = now;
+		} else if (now - tqpair->diag_sock_cb_log_tsc > 10ULL * hz) {
+			uint64_t dt = now - tqpair->diag_sock_cb_log_tsc;
+			SPDK_NOTICELOG("DIAG_SOCK_CB: tqpair=%p state=%d recv_state=%d "
+				       "cnt=%lu rate=%lu/s window_ms=%lu\n",
+				       tqpair, tqpair->state, tqpair->recv_state,
+				       tqpair->diag_sock_cb_count,
+				       (tqpair->diag_sock_cb_count * hz) / dt,
+				       (dt * 1000ULL) / hz);
+			tqpair->diag_sock_cb_count = 0;
+			tqpair->diag_sock_cb_log_tsc = now;
+		}
+	}
 
 	nvmf_tcp_qpair_process(tqpair);
 }
