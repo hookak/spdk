@@ -130,8 +130,16 @@ struct spdk_nvmf_request {
 	uint64_t timeout_tsc;
 	uint32_t			orig_nsid;
 	STAILQ_ENTRY(spdk_nvmf_request)	reservation_link;
+
+	/* DIAG D13 (n3r/longhorn#324, iteration #6): tsc at which
+	 * spdk_nvmf_request_exec placed this request on qpair->outstanding.
+	 * _nvmf_request_complete uses it to emit a NOTICELOG if completion
+	 * took longer than 5s. Requests entering outstanding via paths we
+	 * did not hook (eg fabric connect or AER repost) leave this at 0,
+	 * which the complete path treats as "skip latency check". */
+	uint64_t			diag_submit_tsc;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 832, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 840, "Incorrect size");
 
 enum spdk_nvmf_qpair_state {
 	SPDK_NVMF_QPAIR_UNINITIALIZED = 0,

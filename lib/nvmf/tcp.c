@@ -350,6 +350,12 @@ struct spdk_nvmf_tcp_qpair {
 	 * diag_read_fail_logged gates the D7 log to once per qpair lifetime. */
 	uint64_t				diag_last_recv_tsc;
 	bool					diag_read_fail_logged;
+
+	/* DIAG D14 (n3r/longhorn#324, iteration #6): tsc of the most recent
+	 * DIAG_QPAIR_IDLE alert fired for this tqpair. Rate-limits the alert
+	 * to once per 30s per qpair so a sustained idle period does not spam
+	 * the IM log. 0 = never fired. */
+	uint64_t				diag_idle_alert_tsc;
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -3528,6 +3534,31 @@ nvmf_tcp_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *soc
 				       (dt * 1000ULL) / hz);
 			tqpair->diag_sock_cb_count = 0;
 			tqpair->diag_sock_cb_log_tsc = now;
+		}
+
+		/* DIAG D14 (n3r/longhorn#324, iteration #6): sampled once per
+		 * 1024 sock_cb fires, alert if the qpair has not had a successful
+		 * recv in >= 30s. That brackets the host nvme.io_timeout window
+		 * (30s default) so an alert here precedes the host-driven reset
+		 * with enough margin to inspect the qpair state. Rate-limited
+		 * per-qpair at 30s via diag_idle_alert_tsc. Caveat: a fully idle
+		 * qpair (no PDU traffic at all) only triggers sock_cb when the
+		 * host kernel reset fires EPOLLHUP — so the alert lags by one
+		 * cycle in the truly silent case. */
+		if (tqpair->diag_last_recv_tsc) {
+			uint64_t _idle_ms = (now - tqpair->diag_last_recv_tsc) * 1000ULL / hz;
+			if (_idle_ms >= 30000) {
+				uint64_t _since_alert_ms = tqpair->diag_idle_alert_tsc ?
+					(now - tqpair->diag_idle_alert_tsc) * 1000ULL / hz :
+					UINT64_MAX;
+				if (_since_alert_ms >= 30000) {
+					SPDK_NOTICELOG("DIAG_QPAIR_IDLE: tqpair=%p state=%d "
+						       "recv_state=%d idle_ms=%lu\n",
+						       tqpair, tqpair->state,
+						       tqpair->recv_state, _idle_ms);
+					tqpair->diag_idle_alert_tsc = now;
+				}
+			}
 		}
 	}
 
