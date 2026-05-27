@@ -123,7 +123,26 @@ jsonrpc_handler(struct spdk_jsonrpc_request *request,
 	}
 
 	if ((m->state_mask & g_rpc_state) == g_rpc_state) {
+		/* DIAG D12 (n3r/longhorn#324, iteration #6): measure how long the
+		 * synchronous portion of each RPC method handler takes. Many SPDK
+		 * RPC handlers complete fully before returning (eg subsystem
+		 * introspection RPCs like nvmf_subsystem_get_listeners). If one of
+		 * those is stuck — taking a lock that fix-B-unrelated cleanup is
+		 * holding, or iterating a list that has grown pathologically — the
+		 * sync_dt_ms here directly shows it. Async handlers (which return
+		 * fast and complete via callback) only have their entry/return
+		 * window measured here; their tail latency needs separate tracking. */
+		uint64_t _diag_start_tsc = spdk_get_ticks();
 		m->func(request, params);
+		{
+			uint64_t _diag_dt = spdk_get_ticks() - _diag_start_tsc;
+			uint64_t _diag_dt_ms = _diag_dt * 1000ULL / spdk_get_ticks_hz();
+			if (_diag_dt_ms >= 1000) {
+				SPDK_NOTICELOG("DIAG_RPC_HANDLER_SLOW: method=%s "
+					       "sync_dt_ms=%lu\n",
+					       m->name, _diag_dt_ms);
+			}
+		}
 	} else {
 		if (g_rpc_state == SPDK_RPC_STARTUP) {
 			spdk_jsonrpc_send_error_response_fmt(request,
