@@ -1422,6 +1422,29 @@ spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair)
 
 	/* Check for outstanding I/O */
 	if (!TAILQ_EMPTY(&qpair->outstanding)) {
+		/* DIAG D3 (n3r/longhorn#324): at the moment we defer the close
+		 * waiting for outstanding I/O to drain, capture the size of the
+		 * outstanding queue and a sample of the first few opcodes. This
+		 * is the only place from which the cleanup path can stall, so
+		 * comparing the count here against later DIAG_SOCK_CB rates tells
+		 * us whether bdev completions are being starved (count never
+		 * drops) or arriving normally (count would drop on its own). */
+		int diag_cnt = 0;
+		uint8_t diag_opc[5] = {0xff, 0xff, 0xff, 0xff, 0xff};
+		struct spdk_nvmf_request *diag_iter;
+		TAILQ_FOREACH(diag_iter, &qpair->outstanding, link) {
+			if (diag_cnt < 5 && diag_iter->cmd) {
+				diag_opc[diag_cnt] = diag_iter->cmd->nvme_cmd.opc;
+			}
+			diag_cnt++;
+		}
+		SPDK_NOTICELOG("DIAG_DEFER: qpair=%p cntlid=%hu hostnqn=%s outstanding=%d "
+			       "first5_opc=[%02x %02x %02x %02x %02x]\n",
+			       qpair,
+			       qpair->ctrlr ? qpair->ctrlr->cntlid : 0,
+			       qpair->ctrlr ? qpair->ctrlr->hostnqn : "(no-ctrlr)",
+			       diag_cnt,
+			       diag_opc[0], diag_opc[1], diag_opc[2], diag_opc[3], diag_opc[4]);
 		SPDK_DTRACE_PROBE2_TICKS(nvmf_poll_group_drain_qpair, qpair, spdk_thread_get_id(group->thread));
 		qpair->state_cb = _nvmf_qpair_destroy;
 		qpair->state_cb_arg = qpair_ctx;

@@ -253,6 +253,16 @@ struct spdk_nvmf_tcp_req  {
 
 	enum spdk_nvmf_tcp_req_state		state;
 
+	/* DIAG D15 (n3r/longhorn#324, iter#7): diag_state_tsc is stamped in
+	 * nvmf_tcp_req_set_state on every transition; diag_stuck_logged gates
+	 * the once-per-state DIAG_REQ_STUCK log. The poll-group scan uses these
+	 * to surface a req parked in a non-terminal state >= 5s — a received
+	 * command that never completes while the reactor is otherwise idle (the
+	 * idle-stall trigger that D13's exec→complete window cannot see, since a
+	 * req stuck pre-exec in NEED_BUFFER/AWAITING_R2T never reaches exec). */
+	uint64_t				diag_state_tsc;
+	bool					diag_stuck_logged;
+
 	/*
 	 * h2c_offset is used when we receive the h2c_data PDU.
 	 */
@@ -329,6 +339,33 @@ struct spdk_nvmf_tcp_qpair {
 
 	TAILQ_ENTRY(spdk_nvmf_tcp_qpair)	link;
 	bool					pending_flush;
+
+	/* DIAG (n3r/longhorn#324): instrumentation to identify the root cause
+	 * of reactor-100% saturation after a peer disconnect. These two fields
+	 * count how often nvmf_tcp_sock_cb is invoked on this tqpair and gate
+	 * a periodic NOTICELOG so a runaway sock_cb loop becomes visible. */
+	uint64_t				diag_sock_cb_count;
+	uint64_t				diag_sock_cb_log_tsc;
+
+	/* DIAG D7/D8 (n3r/longhorn#324): the first time a socket read into
+	 * sock_process returns < 0 we want to know the errno, whether the
+	 * socket is still considered connected, and how long it had been
+	 * since the last successful recv. That distinguishes the two observed
+	 * hang scenarios:
+	 *   - Case 1 (idle/timer-driven): long since_last_recv + sock still
+	 *     connected → SPDK-internal trigger (KATO, internal timeout, ...)
+	 *   - Case 2 (host-driven close):  sock_is_connected=0 / rc=0 (EOF) /
+	 *     errno=ECONNRESET → host kernel actively closed
+	 * diag_last_recv_tsc is updated on every rc > 0 read_data return.
+	 * diag_read_fail_logged gates the D7 log to once per qpair lifetime. */
+	uint64_t				diag_last_recv_tsc;
+	bool					diag_read_fail_logged;
+
+	/* DIAG D14 (n3r/longhorn#324, iteration #6): tsc of the most recent
+	 * DIAG_QPAIR_IDLE alert fired for this tqpair. Rate-limits the alert
+	 * to once per 30s per qpair so a sustained idle period does not spam
+	 * the IM log. 0 = never fired. */
+	uint64_t				diag_idle_alert_tsc;
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -346,6 +383,10 @@ struct spdk_nvmf_tcp_poll_group {
 	struct spdk_sock_group			*sock_group;
 
 	TAILQ_HEAD(, spdk_nvmf_tcp_qpair)	qpairs;
+
+	/* DIAG D15 (n3r/longhorn#324, iter#7): rate-limits the stuck-req scan
+	 * in nvmf_tcp_poll_group_poll to once per second per poll group. */
+	uint64_t				diag_stuck_scan_tsc;
 
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
@@ -431,6 +472,11 @@ nvmf_tcp_req_set_state(struct spdk_nvmf_tcp_req *tcp_req,
 	tqpair->state_cntr[state]++;
 
 	tcp_req->state = state;
+
+	/* DIAG D15 (n3r/longhorn#324, iter#7): record state-entry time and
+	 * re-arm the once-per-state stuck log. */
+	tcp_req->diag_state_tsc = spdk_get_ticks();
+	tcp_req->diag_stuck_logged = false;
 }
 
 static inline struct nvme_tcp_pdu *
@@ -1149,6 +1195,17 @@ nvmf_tcp_qpair_disconnect(struct spdk_nvmf_tcp_qpair *tqpair)
 	spdk_trace_record(TRACE_TCP_QP_DISCONNECT, tqpair->qpair.trace_id, 0, 0);
 
 	if (tqpair->state <= NVMF_TCP_QPAIR_STATE_RUNNING) {
+		/* DIAG D2 (n3r/longhorn#324): the first time we tear down this
+		 * tqpair, capture the caller chain so we can identify the trigger
+		 * (TCP sock_process / KATO timer / subsystem teardown / ...).
+		 * Fires exactly once per qpair lifetime — the state guard above
+		 * blocks re-entries naturally. */
+		SPDK_NOTICELOG("DIAG_DISCONNECT_ENTRY: tqpair=%p prev_state=%d recv_state=%d "
+			       "caller=%p caller2=%p caller3=%p\n",
+			       tqpair, tqpair->state, tqpair->recv_state,
+			       __builtin_return_address(0),
+			       __builtin_return_address(1),
+			       __builtin_return_address(2));
 		nvmf_tcp_qpair_set_state(tqpair, NVMF_TCP_QPAIR_STATE_EXITING);
 		assert(tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_ERROR);
 		spdk_poller_unregister(&tqpair->timeout_poller);
@@ -2541,12 +2598,33 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 						sizeof(struct spdk_nvme_tcp_common_pdu_hdr) - pdu->ch_valid_bytes,
 						(void *)&pdu->hdr.common + pdu->ch_valid_bytes);
 			if (rc < 0) {
+				/* DIAG D7 (n3r/longhorn#324): capture socket-level state at
+				 * first read failure so we can distinguish host-close from
+				 * SPDK-internal timer / idle teardown. */
+				if (!tqpair->diag_read_fail_logged) {
+					uint64_t _now = spdk_get_ticks();
+					uint64_t _hz = spdk_get_ticks_hz();
+					uint64_t _dt = tqpair->diag_last_recv_tsc ?
+						(_now - tqpair->diag_last_recv_tsc) * 1000ULL / _hz : 0;
+					int _err = errno;
+					SPDK_NOTICELOG("DIAG_READ_FAIL: tqpair=%p site=AWAIT_PDU_CH "
+						       "rc=%d errno=%d sock_connected=%d "
+						       "state=%d recv_state=%d ch_valid=%u "
+						       "since_last_recv_ms=%lu\n",
+						       tqpair, rc, _err,
+						       spdk_sock_is_connected(tqpair->sock),
+						       tqpair->state, tqpair->recv_state,
+						       pdu->ch_valid_bytes, _dt);
+					tqpair->diag_read_fail_logged = true;
+				}
 				SPDK_DEBUGLOG(nvmf_tcp, "will disconnect tqpair=%p\n", tqpair);
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;
 			} else if (rc > 0) {
 				pdu->ch_valid_bytes += rc;
 				spdk_trace_record(TRACE_TCP_READ_FROM_SOCKET_DONE, tqpair->qpair.trace_id, rc, 0);
+				/* DIAG D8: track last successful recv */
+				tqpair->diag_last_recv_tsc = spdk_get_ticks();
 			}
 
 			if (pdu->ch_valid_bytes < sizeof(struct spdk_nvme_tcp_common_pdu_hdr)) {
@@ -2562,11 +2640,30 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 						pdu->psh_len - pdu->psh_valid_bytes,
 						(void *)&pdu->hdr.raw + sizeof(struct spdk_nvme_tcp_common_pdu_hdr) + pdu->psh_valid_bytes);
 			if (rc < 0) {
+				/* DIAG D7 — see AWAIT_PDU_CH branch above for rationale */
+				if (!tqpair->diag_read_fail_logged) {
+					uint64_t _now = spdk_get_ticks();
+					uint64_t _hz = spdk_get_ticks_hz();
+					uint64_t _dt = tqpair->diag_last_recv_tsc ?
+						(_now - tqpair->diag_last_recv_tsc) * 1000ULL / _hz : 0;
+					int _err = errno;
+					SPDK_NOTICELOG("DIAG_READ_FAIL: tqpair=%p site=AWAIT_PDU_PSH "
+						       "rc=%d errno=%d sock_connected=%d "
+						       "state=%d recv_state=%d psh_valid=%u "
+						       "since_last_recv_ms=%lu\n",
+						       tqpair, rc, _err,
+						       spdk_sock_is_connected(tqpair->sock),
+						       tqpair->state, tqpair->recv_state,
+						       pdu->psh_valid_bytes, _dt);
+					tqpair->diag_read_fail_logged = true;
+				}
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;
 			} else if (rc > 0) {
 				spdk_trace_record(TRACE_TCP_READ_FROM_SOCKET_DONE, tqpair->qpair.trace_id, rc, 0);
 				pdu->psh_valid_bytes += rc;
+				/* DIAG D8: track last successful recv */
+				tqpair->diag_last_recv_tsc = spdk_get_ticks();
 			}
 
 			if (pdu->psh_valid_bytes < pdu->psh_len) {
@@ -2599,10 +2696,29 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 
 			rc = nvme_tcp_read_payload_data(tqpair->sock, pdu);
 			if (rc < 0) {
+				/* DIAG D7 — payload read site */
+				if (!tqpair->diag_read_fail_logged) {
+					uint64_t _now = spdk_get_ticks();
+					uint64_t _hz = spdk_get_ticks_hz();
+					uint64_t _dt = tqpair->diag_last_recv_tsc ?
+						(_now - tqpair->diag_last_recv_tsc) * 1000ULL / _hz : 0;
+					int _err = errno;
+					SPDK_NOTICELOG("DIAG_READ_FAIL: tqpair=%p site=AWAIT_PAYLOAD "
+						       "rc=%d errno=%d sock_connected=%d "
+						       "state=%d recv_state=%d rw_offset=%u "
+						       "since_last_recv_ms=%lu\n",
+						       tqpair, rc, _err,
+						       spdk_sock_is_connected(tqpair->sock),
+						       tqpair->state, tqpair->recv_state,
+						       pdu->rw_offset, _dt);
+					tqpair->diag_read_fail_logged = true;
+				}
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;
 			}
 			pdu->rw_offset += rc;
+			/* DIAG D8: payload-read recv counts as activity too */
+			if (rc > 0) { tqpair->diag_last_recv_tsc = spdk_get_ticks(); }
 
 			if (pdu->rw_offset < data_len) {
 				return NVME_TCP_PDU_IN_PROGRESS;
@@ -3415,6 +3531,56 @@ nvmf_tcp_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *soc
 {
 	struct spdk_nvmf_tcp_qpair *tqpair = arg;
 
+	/* DIAG D1 (n3r/longhorn#324): per-tqpair sock_cb fire counter. We log
+	 * the rolling 10s rate so a sustained sock_cb spin (which is what we
+	 * suspect drives the reactor-100% deadlock after a peer disconnect)
+	 * shows up directly in the IM log. Health: cnt stays low (idle qpair)
+	 * or matches genuine I/O. Pathology: cnt rises into the 100k/s range
+	 * even while the qpair is supposed to be tearing down. */
+	tqpair->diag_sock_cb_count++;
+	if (spdk_unlikely((tqpair->diag_sock_cb_count & 0x3FF) == 0)) {
+		uint64_t now = spdk_get_ticks();
+		uint64_t hz = spdk_get_ticks_hz();
+		if (tqpair->diag_sock_cb_log_tsc == 0) {
+			tqpair->diag_sock_cb_log_tsc = now;
+		} else if (now - tqpair->diag_sock_cb_log_tsc > 10ULL * hz) {
+			uint64_t dt = now - tqpair->diag_sock_cb_log_tsc;
+			SPDK_NOTICELOG("DIAG_SOCK_CB: tqpair=%p state=%d recv_state=%d "
+				       "cnt=%lu rate=%lu/s window_ms=%lu\n",
+				       tqpair, tqpair->state, tqpair->recv_state,
+				       tqpair->diag_sock_cb_count,
+				       (tqpair->diag_sock_cb_count * hz) / dt,
+				       (dt * 1000ULL) / hz);
+			tqpair->diag_sock_cb_count = 0;
+			tqpair->diag_sock_cb_log_tsc = now;
+		}
+
+		/* DIAG D14 (n3r/longhorn#324, iteration #6): sampled once per
+		 * 1024 sock_cb fires, alert if the qpair has not had a successful
+		 * recv in >= 30s. That brackets the host nvme.io_timeout window
+		 * (30s default) so an alert here precedes the host-driven reset
+		 * with enough margin to inspect the qpair state. Rate-limited
+		 * per-qpair at 30s via diag_idle_alert_tsc. Caveat: a fully idle
+		 * qpair (no PDU traffic at all) only triggers sock_cb when the
+		 * host kernel reset fires EPOLLHUP — so the alert lags by one
+		 * cycle in the truly silent case. */
+		if (tqpair->diag_last_recv_tsc) {
+			uint64_t _idle_ms = (now - tqpair->diag_last_recv_tsc) * 1000ULL / hz;
+			if (_idle_ms >= 30000) {
+				uint64_t _since_alert_ms = tqpair->diag_idle_alert_tsc ?
+					(now - tqpair->diag_idle_alert_tsc) * 1000ULL / hz :
+					UINT64_MAX;
+				if (_since_alert_ms >= 30000) {
+					SPDK_NOTICELOG("DIAG_QPAIR_IDLE: tqpair=%p state=%d "
+						       "recv_state=%d idle_ms=%lu\n",
+						       tqpair, tqpair->state,
+						       tqpair->recv_state, _idle_ms);
+					tqpair->diag_idle_alert_tsc = now;
+				}
+			}
+		}
+	}
+
 	nvmf_tcp_qpair_process(tqpair);
 }
 
@@ -3562,6 +3728,50 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	num_events = spdk_sock_group_poll(tgroup->sock_group);
 	if (spdk_unlikely(num_events < 0)) {
 		SPDK_ERRLOG("Failed to poll sock_group=%p\n", tgroup->sock_group);
+	}
+
+	/* DIAG D15 (n3r/longhorn#324, iter#7): once per second, scan every
+	 * tcp_req on this poll group and log any parked in a non-terminal state
+	 * >= 5s. This runs in the poll loop (not sock_cb), so it fires even when
+	 * the reactor is otherwise idle — exactly the idle-stall trigger where a
+	 * received command never completes. Logged once per (req, state) entry.
+	 * req_state: 1=NEW 2=NEED_BUFFER 3=HAVE_BUFFER 6=XFER_H2C 7=AWAIT_R2T_ACK
+	 * 8=READY_TO_EXEC 9=EXECUTING 11=EXECUTED 12=READY_TO_COMPLETE 13=XFER_C2H. */
+	{
+		uint64_t _d_now = spdk_get_ticks();
+		uint64_t _d_hz = spdk_get_ticks_hz();
+
+		if (_d_hz > 0 && _d_now - tgroup->diag_stuck_scan_tsc >= _d_hz) {
+			struct spdk_nvmf_tcp_qpair *_d_tq;
+
+			tgroup->diag_stuck_scan_tsc = _d_now;
+			TAILQ_FOREACH(_d_tq, &tgroup->qpairs, link) {
+				uint32_t _d_i;
+
+				for (_d_i = 0; _d_i < _d_tq->resource_count; _d_i++) {
+					struct spdk_nvmf_tcp_req *_d_r = &_d_tq->reqs[_d_i];
+
+					if (_d_r->state == TCP_REQUEST_STATE_FREE ||
+					    _d_r->state == TCP_REQUEST_STATE_COMPLETED ||
+					    _d_r->diag_stuck_logged ||
+					    _d_r->diag_state_tsc == 0) {
+						continue;
+					}
+					if (_d_now - _d_r->diag_state_tsc >= 5 * _d_hz) {
+						SPDK_NOTICELOG("DIAG_REQ_STUCK: qpair=%p qid=%u cid=%u "
+							       "opc=0x%02x req_state=%d qp_state=%d "
+							       "recv_state=%d dt_ms=%lu\n",
+							       _d_tq, _d_tq->qpair.qid,
+							       _d_r->req.cmd->nvme_cmd.cid,
+							       _d_r->req.cmd->nvme_cmd.opc,
+							       _d_r->state, _d_tq->state,
+							       _d_tq->recv_state,
+							       (_d_now - _d_r->diag_state_tsc) * 1000 / _d_hz);
+						_d_r->diag_stuck_logged = true;
+					}
+				}
+			}
+		}
 	}
 
 	return num_events;

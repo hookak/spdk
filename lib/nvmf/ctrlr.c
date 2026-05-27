@@ -4947,6 +4947,23 @@ _nvmf_request_complete(void *ctx)
 	opcode = req->cmd->nvmf_cmd.opcode;
 	qpair = req->qpair;
 
+	/* DIAG D13 (n3r/longhorn#324, iteration #6): if this request entered
+	 * outstanding via spdk_nvmf_request_exec (diag_submit_tsc != 0) and
+	 * took >= 5s to complete, surface a NOTICELOG. The threshold is well
+	 * below the host nvme.io_timeout default (30s) so SPDK-side stalls
+	 * become visible before the host gives up and resets the controller. */
+	if (req->diag_submit_tsc != 0) {
+		uint64_t _diag_now = spdk_get_ticks();
+		uint64_t _diag_hz = spdk_get_ticks_hz();
+		uint64_t _diag_dt_ms = (_diag_now - req->diag_submit_tsc) * 1000ULL / _diag_hz;
+		if (_diag_dt_ms >= 5000) {
+			SPDK_NOTICELOG("DIAG_REQ_LATENCY: qpair=%p qid=%u opc=0x%02x "
+				       "dt_ms=%lu\n",
+				       qpair, qpair->qid,
+				       req->cmd->nvme_cmd.opc, _diag_dt_ms);
+		}
+	}
+
 	/* request should not be on a ns reservations list */
 	assert(req->reservation_queued == false);
 
@@ -5208,6 +5225,11 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf")) {
 		spdk_nvme_print_command(qpair->qid, &req->cmd->nvme_cmd);
 	}
+
+	/* DIAG D13 (n3r/longhorn#324, iteration #6): timestamp request entry
+	 * to outstanding so _nvmf_request_complete can detect SPDK-side stalls
+	 * (>= 5s) well before the host nvme.io_timeout (30s default) fires. */
+	req->diag_submit_tsc = spdk_get_ticks();
 
 	/* Place the request on the outstanding list so we can keep track of it */
 	TAILQ_INSERT_TAIL(&qpair->outstanding, req, link);
