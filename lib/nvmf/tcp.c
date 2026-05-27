@@ -253,6 +253,16 @@ struct spdk_nvmf_tcp_req  {
 
 	enum spdk_nvmf_tcp_req_state		state;
 
+	/* DIAG D15 (n3r/longhorn#324, iter#7): diag_state_tsc is stamped in
+	 * nvmf_tcp_req_set_state on every transition; diag_stuck_logged gates
+	 * the once-per-state DIAG_REQ_STUCK log. The poll-group scan uses these
+	 * to surface a req parked in a non-terminal state >= 5s — a received
+	 * command that never completes while the reactor is otherwise idle (the
+	 * idle-stall trigger that D13's exec→complete window cannot see, since a
+	 * req stuck pre-exec in NEED_BUFFER/AWAITING_R2T never reaches exec). */
+	uint64_t				diag_state_tsc;
+	bool					diag_stuck_logged;
+
 	/*
 	 * h2c_offset is used when we receive the h2c_data PDU.
 	 */
@@ -374,6 +384,10 @@ struct spdk_nvmf_tcp_poll_group {
 
 	TAILQ_HEAD(, spdk_nvmf_tcp_qpair)	qpairs;
 
+	/* DIAG D15 (n3r/longhorn#324, iter#7): rate-limits the stuck-req scan
+	 * in nvmf_tcp_poll_group_poll to once per second per poll group. */
+	uint64_t				diag_stuck_scan_tsc;
+
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
 
@@ -458,6 +472,11 @@ nvmf_tcp_req_set_state(struct spdk_nvmf_tcp_req *tcp_req,
 	tqpair->state_cntr[state]++;
 
 	tcp_req->state = state;
+
+	/* DIAG D15 (n3r/longhorn#324, iter#7): record state-entry time and
+	 * re-arm the once-per-state stuck log. */
+	tcp_req->diag_state_tsc = spdk_get_ticks();
+	tcp_req->diag_stuck_logged = false;
 }
 
 static inline struct nvme_tcp_pdu *
@@ -3709,6 +3728,50 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	num_events = spdk_sock_group_poll(tgroup->sock_group);
 	if (spdk_unlikely(num_events < 0)) {
 		SPDK_ERRLOG("Failed to poll sock_group=%p\n", tgroup->sock_group);
+	}
+
+	/* DIAG D15 (n3r/longhorn#324, iter#7): once per second, scan every
+	 * tcp_req on this poll group and log any parked in a non-terminal state
+	 * >= 5s. This runs in the poll loop (not sock_cb), so it fires even when
+	 * the reactor is otherwise idle — exactly the idle-stall trigger where a
+	 * received command never completes. Logged once per (req, state) entry.
+	 * req_state: 1=NEW 2=NEED_BUFFER 3=HAVE_BUFFER 6=XFER_H2C 7=AWAIT_R2T_ACK
+	 * 8=READY_TO_EXEC 9=EXECUTING 11=EXECUTED 12=READY_TO_COMPLETE 13=XFER_C2H. */
+	{
+		uint64_t _d_now = spdk_get_ticks();
+		uint64_t _d_hz = spdk_get_ticks_hz();
+
+		if (_d_hz > 0 && _d_now - tgroup->diag_stuck_scan_tsc >= _d_hz) {
+			struct spdk_nvmf_tcp_qpair *_d_tq;
+
+			tgroup->diag_stuck_scan_tsc = _d_now;
+			TAILQ_FOREACH(_d_tq, &tgroup->qpairs, link) {
+				uint32_t _d_i;
+
+				for (_d_i = 0; _d_i < _d_tq->resource_count; _d_i++) {
+					struct spdk_nvmf_tcp_req *_d_r = &_d_tq->reqs[_d_i];
+
+					if (_d_r->state == TCP_REQUEST_STATE_FREE ||
+					    _d_r->state == TCP_REQUEST_STATE_COMPLETED ||
+					    _d_r->diag_stuck_logged ||
+					    _d_r->diag_state_tsc == 0) {
+						continue;
+					}
+					if (_d_now - _d_r->diag_state_tsc >= 5 * _d_hz) {
+						SPDK_NOTICELOG("DIAG_REQ_STUCK: qpair=%p qid=%u cid=%u "
+							       "opc=0x%02x req_state=%d qp_state=%d "
+							       "recv_state=%d dt_ms=%lu\n",
+							       _d_tq, _d_tq->qpair.qid,
+							       _d_r->req.cmd->nvme_cmd.cid,
+							       _d_r->req.cmd->nvme_cmd.opc,
+							       _d_r->state, _d_tq->state,
+							       _d_tq->recv_state,
+							       (_d_now - _d_r->diag_state_tsc) * 1000 / _d_hz);
+						_d_r->diag_stuck_logged = true;
+					}
+				}
+			}
+		}
 	}
 
 	return num_events;
